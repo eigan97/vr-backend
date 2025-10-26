@@ -1,5 +1,5 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
@@ -11,11 +11,12 @@ import os
 # Inicializar Firebase
 cred = credentials.Certificate("app/config/serviceAccountKey.json")
 firebase_admin.initialize_app(cred, {
-    'storageBucket': 'vr-backend-24b89.appspot.com'
+    'storageBucket': 'vr-backend-24b89.firebasestorage.app'
 })
 
 # Router para manejar todas las operaciones relacionadas con imágenes
 router = APIRouter(prefix="/imagenes", tags=["Imágenes"])
+
 
 db = firestore.client()
 bucket = storage.bucket()
@@ -33,17 +34,26 @@ async def subir_imagen(
     Endpoint para subir una nueva imagen al sistema.
     Recibe el nombre de la pieza, descripción y el archivo de imagen.
     """
-    # Generar URLs simuladas (sin subir imagen)
-    mock_initial_url = f"https://picsum.photos/600"
-    mock_generated_url = f"https://picsum.photos/601"
 
+    file_data = await imagen.read()
+
+    unique_filename = f"images/{uuid.uuid4()}_{imagen.filename}"
+
+    blob = bucket.blob(unique_filename)
+    blob.upload_from_string(file_data, content_type=imagen.content_type)
+
+    blob.make_public()
+
+    image_url = blob.public_url
+
+    mock_generated_url = "https://picsum.photos/601"
     # Construir registro en Firestore
     doc = {
         "nombre": nombre_pieza,
         "description": descripcion,
-        "initialImageUrl": mock_initial_url,
+        "initialImageUrl": image_url,
         "generatedImageUrl": mock_generated_url,  # luego se actualizará cuando generes la versión IA
-        "createdAt": datetime.utcnow().isoformat()
+        "createdAt": datetime.now(timezone.utc).isoformat()
     }
 
     db.collection("galeria").add(doc)
@@ -93,7 +103,7 @@ async def obtener_imagen(image_id: str):
 
         # Verificar si existe
         if not doc.exists:
-            raise HTTPException(status_code=404, detail=f"La imagen con ID '{image_id}' no existe.")
+            raise HTTPException(status_code=404, detail=f"La imagen con ID '{imagen_id}' no existe.")
 
         # Convertir a diccionario y añadir el ID
         data = doc.to_dict()
@@ -127,13 +137,13 @@ async def actualizar_imagen(
 
         # Verificar si existe
         if not doc.exists:
-            raise HTTPException(status_code=404, detail=f"La imagen con ID '{image_id}' no existe.")
+            raise HTTPException(status_code=404, detail=f"La imagen con ID '{imagen_id}' no existe.")
 
         # Datos a actualizar
         data_update = {
             "nombre": nombre_pieza,
             "description": descripcion,
-            "updatedAt": datetime.utcnow().isoformat()
+            "updatedAt": datetime.now(timezone.utc).isoformat()
         }
 
         # Actualizar en Firestore
@@ -163,7 +173,7 @@ async def eliminar_imagen(image_id: str):
 
         # Verificar si el documento existe
         if not doc.exists:
-            raise HTTPException(status_code=404, detail=f"La imagen con ID '{image_id}' no existe.")
+            raise HTTPException(status_code=404, detail=f"La imagen con ID '{imagen_id}' no existe.")
 
         # Eliminar documento de Firestore
         doc_ref.delete()
@@ -180,46 +190,70 @@ async def eliminar_imagen(image_id: str):
 
 # POST /imagenes/generar_imagen_ia
 @router.post("/generar_imagen_ia")
-async def generar_imagen(prompt: str = Form(...), imagen: UploadFile = File(...)):
+async def generar_imagen(prompt: str = Form(...), imagen_id: str = Form(...)):
     """
     Endpoint para generar una nueva imagen usando inteligencia artificial.
     Combina un prompt de texto con una imagen base para crear una nueva imagen.
     """
-    
     try:
-        # Guardar temporalmente la imagen recibida
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-            tmp.write(await imagen.read())
-            tmp_path = tmp.name
-        mock_initial_url = f"_"
-
+        # Buscar el registro por ID
+        doc_ref = db.collection("galeria").document(imagen_id)
+        doc = doc_ref.get()
+        
+        # Verificar si existe
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail=f"La imagen con ID '{imagen_id}' no existe.")
+        
+        # Obtener los datos del documento
+        data = doc.to_dict()
+        initial_image_url = data.get("initialImageUrl")
+        
+        if not initial_image_url:
+            raise HTTPException(status_code=400, detail="La imagen no tiene una URL inicial válida.")
+        
         # Ejecutar el modelo de Replicate
         output = replicate.run(
             "black-forest-labs/flux-kontext-pro",
             input={
-                "prompt": "Make this a 90s cartoon",
-                "input_image": mock_initial_url,
+                "prompt": prompt,
+                "input_image": initial_image_url,
                 "aspect_ratio": "match_input_image",
                 "output_format": "jpg",
                 "safety_tolerance": 2,
                 "prompt_upsampling": False
             }
         )
-
-        # El modelo devuelve una o más URLs de imagen
+        
+        # Obtener la URL de la imagen generada
+        # Replicate puede devolver una lista, string o FileOutput object
         if isinstance(output, list):
-            image_url = output[0]
+            # Si es una lista, tomar el primer elemento
+            first_output = output[0]
+            if hasattr(first_output, 'url'):
+                generated_image_url = first_output.url
+            else:
+                generated_image_url = str(first_output)
         else:
-            image_url = output
-
-        # Eliminar el archivo temporal
-        os.remove(tmp_path)
-
+            # Si es un solo elemento
+            if hasattr(output, 'url'):
+                generated_image_url = output.url
+            else:
+                generated_image_url = str(output)
+        
+        # Actualizar el registro en Firestore con la nueva URL generada
+        doc_ref.update({
+            "generatedImageUrl": generated_image_url,
+            "updatedAt": datetime.now(timezone.utc).isoformat()
+        })
+        
         return {
             "message": "Imagen generada correctamente usando IA.",
+            "imagen_id": imagen_id,
             "prompt": prompt,
-            "generated_image_url": image_url
+            "generated_image_url": generated_image_url
         }
-
+        
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al generar la imagen: {str(e)}")
