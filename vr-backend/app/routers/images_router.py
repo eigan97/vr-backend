@@ -190,10 +190,19 @@ async def eliminar_imagen(image_id: str):
 
 # POST /imagenes/generar_imagen_ia
 @router.post("/generar_imagen_ia")
-async def generar_imagen(prompt: str = Form(...), imagen_id: str = Form(...)):
+async def generar_imagen(
+    prompt: str = Form(...), 
+    imagen_id: str = Form(...),
+    model: str = Form(...),  # "replicate" o "openai"
+    style_description: str = Form(...)
+):
     """
     Endpoint para generar una nueva imagen usando inteligencia artificial.
     Combina un prompt de texto con una imagen base para crear una nueva imagen.
+    Parámetros:
+    - prompt: Descripción de la imagen a generar
+    - imagen_id: ID del registro en Firestore
+    - model: "replicate" o "openai"
     """
     try:
         # Buscar el registro por ID
@@ -211,34 +220,21 @@ async def generar_imagen(prompt: str = Form(...), imagen_id: str = Form(...)):
         if not initial_image_url:
             raise HTTPException(status_code=400, detail="La imagen no tiene una URL inicial válida.")
         
-        # Ejecutar el modelo de Replicate
-        output = replicate.run(
-            "black-forest-labs/flux-kontext-pro",
-            input={
-                "prompt": prompt,
-                "input_image": initial_image_url,
-                "aspect_ratio": "match_input_image",
-                "output_format": "jpg",
-                "safety_tolerance": 2,
-                "prompt_upsampling": False
-            }
-        )
+        # Importar las funciones del modelo
+        from app.model.model import generar_imagen_replicate, generar_imagen_openai
         
-        # Obtener la URL de la imagen generada
-        # Replicate puede devolver una lista, string o FileOutput object
-        if isinstance(output, list):
-            # Si es una lista, tomar el primer elemento
-            first_output = output[0]
-            if hasattr(first_output, 'url'):
-                generated_image_url = first_output.url
-            else:
-                generated_image_url = str(first_output)
+        # Ejecutar el modelo seleccionado
+        if model.lower() == "replicate":
+            generated_image_url = generar_imagen_replicate(prompt, initial_image_url)
+            model_name = "Replicate (Flux Kontext Pro)"
+        elif model.lower() == "openai":
+            generated_image_url = generar_imagen_openai(prompt, initial_image_url, style_description)
+            model_name = "OpenAI (GPT-4o + DALL-E 3)"
         else:
-            # Si es un solo elemento
-            if hasattr(output, 'url'):
-                generated_image_url = output.url
-            else:
-                generated_image_url = str(output)
+            raise HTTPException(
+                status_code=400, 
+                detail="Model debe ser 'replicate' o 'openai'"
+            )
         
         # Actualizar el registro en Firestore con la nueva URL generada
         doc_ref.update({
@@ -247,10 +243,11 @@ async def generar_imagen(prompt: str = Form(...), imagen_id: str = Form(...)):
         })
         
         return {
-            "message": "Imagen generada correctamente usando IA.",
+            "message": f"Imagen generada correctamente usando {model_name}.",
             "imagen_id": imagen_id,
             "prompt": prompt,
-            "generated_image_url": generated_image_url
+            "generated_image_url": generated_image_url,
+            "model_used": model_name
         }
         
     except HTTPException as e:
