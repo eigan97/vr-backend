@@ -10,7 +10,7 @@ import os
 import httpx
 
 # Inicializar Firebase
-cred = credentials.Certificate("app/config/serviceAccountKey.json")
+cred = credentials.Certificate("/etc/secrets/serviceAccountKey.json")
 firebase_admin.initialize_app(cred, {
     'storageBucket': 'vr-backend-24b89.firebasestorage.app'
 })
