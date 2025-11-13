@@ -77,7 +77,6 @@ def generar_imagen_openai(prompt: str, image_url: str, style_description_model: 
             size="1024x1024",
             style=style_description_model,
         )
-
         generated_url = response.data[0].url
         return generated_url
         

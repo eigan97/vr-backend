@@ -7,9 +7,10 @@ from dotenv import load_dotenv
 import tempfile 
 import replicate
 import os
+import httpx
 
 # Inicializar Firebase
-cred = credentials.Certificate("/etc/secrets/serviceAccountKey.json")
+cred = credentials.Certificate("app/config/serviceAccountKey.json")
 firebase_admin.initialize_app(cred, {
     'storageBucket': 'vr-backend-24b89.firebasestorage.app'
 })
@@ -254,3 +255,117 @@ async def generar_imagen(
         raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al generar la imagen: {str(e)}")
+
+async def descargar_y_subir_imagen_a_firebase(image_url: str) -> str:
+    """
+    Descarga una imagen desde una URL y la sube a Firebase Storage.
+    Retorna la URL pública de la imagen en Firebase.
+    """
+    try:
+        # Descargar la imagen desde la URL usando httpx (asíncrono)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(image_url)
+            response.raise_for_status()
+            
+            # Obtener el tipo de contenido de la respuesta o usar un default
+            content_type = response.headers.get('content-type', 'image/png')
+            image_content = response.content
+            
+            # Generar un nombre único para el archivo
+            unique_filename = f"generated_images/{uuid.uuid4()}.png"
+            
+            # Subir a Firebase Storage
+            blob = bucket.blob(unique_filename)
+            blob.upload_from_string(image_content, content_type=content_type)
+            blob.make_public()
+            
+            return blob.public_url
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error al descargar y subir la imagen a Firebase: {str(e)}"
+        )
+
+# POST /imagenes/subir_y_generar_ia
+@router.post("/subir_y_generar_ia")
+async def subir_y_generar_imagen_ia(
+    nombre_pieza: str = Form(...),
+    descripcion: str = Form(...),
+    imagen: UploadFile = File(...),
+    prompt: str = Form(...),
+    model: str = Form(...),  # "replicate" o "openai"
+    style_description: str = Form(...)
+):
+    """
+    Endpoint combinado que primero sube una imagen y luego genera una imagen de IA.
+    La imagen generada por IA se descarga y se sube automáticamente a Firebase Storage.
+    
+    Parámetros:
+    - nombre_pieza: Nombre de la pieza
+    - descripcion: Descripción de la imagen
+    - imagen: Archivo de imagen a subir
+    - prompt: Descripción de la imagen a generar con IA
+    - model: "replicate" o "openai"
+    - style_description: Descripción del estilo (solo para OpenAI)
+    """
+    try:
+        # PASO 1: Subir la imagen inicial
+        file_data = await imagen.read()
+        unique_filename = f"images/{uuid.uuid4()}_{imagen.filename}"
+        
+        blob = bucket.blob(unique_filename)
+        blob.upload_from_string(file_data, content_type=imagen.content_type)
+        blob.make_public()
+        
+        initial_image_url = blob.public_url
+        
+        # PASO 2: Generar imagen de IA
+        from app.model.model import generar_imagen_replicate, generar_imagen_openai
+        
+        if model.lower() == "replicate":
+            generated_image_url = generar_imagen_replicate(prompt, initial_image_url)
+            model_name = "Replicate (Flux Kontext Pro)"
+        elif model.lower() == "openai":
+            generated_image_url = generar_imagen_openai(prompt, initial_image_url, style_description)
+            model_name = "OpenAI (GPT-4o + DALL-E 3)"
+        else:
+            raise HTTPException(
+                status_code=400, 
+                detail="Model debe ser 'replicate' o 'openai'"
+            )
+        
+        # PASO 3: Descargar la imagen generada y subirla a Firebase Storage
+        generated_image_firebase_url = await descargar_y_subir_imagen_a_firebase(generated_image_url)
+        
+        # PASO 4: Crear registro en Firestore con ambas URLs
+        doc = {
+            "nombre": nombre_pieza,
+            "description": descripcion,
+            "initialImageUrl": initial_image_url,
+            "generatedImageUrl": generated_image_firebase_url,
+            "createdAt": datetime.now(timezone.utc).isoformat()
+        }
+        
+        doc_ref = db.collection("galeria").add(doc)
+        doc_id = doc_ref[1].id
+        
+        return {
+            "message": f"Imagen subida y generada correctamente usando {model_name}.",
+            "imagen_id": doc_id,
+            "data": {
+                **doc,
+                "id": doc_id
+            },
+            "prompt": prompt,
+            "model_used": model_name
+        }
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error al subir y generar la imagen: {str(e)}"
+        )
+
